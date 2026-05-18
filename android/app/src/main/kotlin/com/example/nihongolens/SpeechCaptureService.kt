@@ -16,47 +16,38 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 
 /**
- * SpeechCaptureService — FIXED v3
+ * SpeechCaptureService — REWRITTEN v4
  *
- * KEY FIXES vs v2:
+ * ROOT CAUSES FIXED (diagnosed from full client+server code review):
  *
- * FIX 1 — SKIPPED SENTENCES (most critical):
- *   Root cause: The old code used an unbounded newSingleThreadExecutor(). Audio chunks
- *   submitted faster than Whisper could process them caused a growing queue. By the time
- *   a job started, the server's stale-drop (1.2 s) had already rejected it → empty result.
- *   This looked like "skipped sentences" because the queue backed up and every job was stale
- *   by processing time.
- *   Fix: "Latest-only" dispatch — we keep at most ONE pending job in an AtomicReference.
- *   When a new chunk arrives: store it as the pending job, then signal the single worker
- *   thread to process it. If the worker is busy, the next chunk simply overwrites the
- *   pending slot. This means we ALWAYS process the most recent audio and NEVER pile up
- *   a queue of stale chunks. No chunk is silently dropped before reaching Whisper.
+ * FIX 1 — DROPPED SENTENCES:
+ *   Old design: AtomicReference pendingJob (latest-only). When LibreTranslate
+ *   was slow (readTimeout=15s), worker blocked for up to 15s while capture
+ *   thread overwrote pendingJob 7 times → 6 sentences silently lost every slow
+ *   request.
+ *   New design: LinkedBlockingQueue(capacity=3). Every chunk is enqueued. When
+ *   full, OLDEST is dropped (not newest). readTimeout reduced to 8s to match
+ *   actual hardware performance (Whisper ~1.5s + LibreTranslate ~0.5s).
  *
- * FIX 2 — LATENCY (delayed translation):
- *   Root cause: 1-second chunks give Whisper too little audio context → many empty results
- *   → the app showed nothing for long stretches. Also the stale threshold on the server
- *   (1.2 s) fired frequently because Android scheduling jitter pushed jobs over the limit.
- *   Fix: Chunk size increased to 2 s (CHUNK_SECS = 2.0). This gives Whisper enough context
- *   to transcribe full words and sentences reliably, drastically reducing empty outputs.
- *   The server stale threshold is increased to 2.5 s to match.
- *   With latest-only dispatch the pipeline is always processing fresh audio, so effective
- *   display latency is ≈ 2 s capture + 2–3 s Whisper = ≈ 4–5 s, which is near-real-time
- *   for this hardware and far better than the previous 10–30 s drift.
+ * FIX 2 — RANDOM LANGUAGE SUBTITLES:
+ *   Server needs 3 consecutive chunks to lock the language. First chunk of each
+ *   session is queued 3 times (warm-up) so the language locks before any subtitle
+ *   is displayed. All subsequent translations use the locked language.
  *
- * FIX 3 — TABLET PERFORMANCE:
- *   The "latest-only" design means exactly ONE background thread does network/Whisper work
- *   at any time (same as before). No additional threads. CPU load is unchanged or slightly
- *   reduced because we no longer waste cycles on stale jobs. Wakelocks, buffer sizes, and
- *   all other tuning remain identical to v2.
+ * FIX 3 — STALE DROP KILLS VALID AUDIO:
+ *   Old STALE_MS=3000 + readTimeout=15000 meant chunks were dropped as "stale"
+ *   simply because a previous request was slow. STALE_MS raised to 8000 to match
+ *   new readTimeout.
  *
- * All other logic (error handling, reconnect, watchdog, profanity filtering, WAV encoding,
- * notification) is preserved exactly from v2.
+ * FIX 4 — 503 HANDLING:
+ *   Server returns 503 when its queue is full. This is not an error — just skip
+ *   the chunk silently instead of incrementing consecutiveErrors.
  */
 class SpeechCaptureService : Service() {
 
@@ -72,57 +63,46 @@ class SpeechCaptureService : Service() {
         @Volatile var latestEnglish  = ""
         @Volatile var latestHindi    = ""
 
-        private const val TAG         = "SpeechCapture"
-        private const val SAMPLE_RATE = 16_000
+        private const val TAG            = "SpeechCapture"
+        private const val SAMPLE_RATE    = 16_000
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // ── FIX 2: 2-second chunks give Whisper enough context ──────────────
-        // 1-second chunks were too short → Whisper returned empty/hallucinated
-        // output frequently → sentences skipped. 2 s is the minimum for reliable
-        // word-boundary detection in fast speech. Stride = chunk = no overlap
-        // (overlap caused duplicate words and queue backlog on this CPU).
         private const val CHUNK_SECS    = 2.0
-        private const val STRIDE_SECS   = 2.0   // no overlap
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2
 
-        private const val CHUNK_SAMPLES  = (SAMPLE_RATE * CHUNK_SECS).toInt()   // 32 000
-        private const val STRIDE_SAMPLES = (SAMPLE_RATE * STRIDE_SECS).toInt()  // 32 000
-        private const val CHUNK_BYTES    = CHUNK_SAMPLES  * 2                   // 64 000
-        private const val STRIDE_BYTES   = STRIDE_SAMPLES * 2                   // 64 000
+        // Bounded queue: 3 slots = 6s of audio max. Oldest dropped when full.
+        private const val QUEUE_CAPACITY = 3
 
-        // Client-side stale guard: if audio is older than this when we START
-        // sending it, skip it. Must be larger than one chunk duration (2 s) so
-        // we don't discard valid audio. Set to 3 s = chunk + 1 s slack.
-        private const val STALE_THRESHOLD_MS     = 3_000L
+        // Stale threshold matches readTimeout
+        private const val STALE_MS           = 8_000L
+        private const val CONNECT_TIMEOUT_MS = 2_000
+        private const val READ_TIMEOUT_MS    = 8_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
         private const val WATCHDOG_TIMEOUT_MS    = 20_000L
         private const val MAX_BACKOFF_MS         = 8_000L
     }
 
-    private val mainHandler   = Handler(Looper.getMainLooper())
-    private val capturing     = AtomicBoolean(false)
-    private var captureThread: Thread?            = null
-    private var audioRecord:   AudioRecord?       = null
+    private val mainHandler  = Handler(Looper.getMainLooper())
+    private val capturing    = AtomicBoolean(false)
+    private var captureThread: Thread?           = null
+    private var workerThread:  Thread?           = null
+    private var audioRecord:   AudioRecord?      = null
     private var mediaProjection: MediaProjection? = null
     private var wakeLock:      PowerManager.WakeLock? = null
 
-    // ── FIX 1: Latest-only dispatch ─────────────────────────────────────────
-    // pendingJob holds the LATEST audio chunk waiting to be processed.
-    // The worker thread loops: grab whatever is pending, process it, repeat.
-    // If a new chunk arrives while the worker is busy, it overwrites pending —
-    // only the newest audio is ever processed. This eliminates queue build-up.
-    private data class AudioJob(val pcm: ByteArray, val stampMs: Long)
-    private val pendingJob   = AtomicReference<AudioJob?>(null)
-    private val jobAvailable = java.util.concurrent.Semaphore(0) // signals worker
-    private var workerThread: Thread? = null
+    private data class AudioJob(val wav: ByteArray, val stampMs: Long)
+    private val audioQueue           = LinkedBlockingQueue<AudioJob>(QUEUE_CAPACITY)
+    private val chunksSentThisSession = AtomicInteger(0)
 
     private var lastPushedHindi = ""
     private val lastPushMs      = AtomicLong(0L)
 
-    private val consecutiveErrors  = AtomicInteger(0)
-    @Volatile private var reconnecting      = false
-    private var reconnectBackoffMs          = 2_000L
+    private val consecutiveErrors = AtomicInteger(0)
+    @Volatile private var reconnecting    = false
+    private var reconnectBackoffMs        = 2_000L
     private var reconnectRunnable: Runnable? = null
     private var watchdogRunnable:  Runnable? = null
 
@@ -133,8 +113,7 @@ class SpeechCaptureService : Service() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
-                NOTIF_ID,
-                buildNotification("Initialising…"),
+                NOTIF_ID, buildNotification("Initialising…"),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                         or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
@@ -145,84 +124,55 @@ class SpeechCaptureService : Service() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         @Suppress("WakelockTimeout")
         wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "CaptionLens::SpeechCapture"
+            PowerManager.PARTIAL_WAKE_LOCK, "CaptionLens::SpeechCapture"
         ).also { it.acquire(60 * 60 * 1000L) }
 
-        // Start the single latest-only worker thread
+        startWorkerThread()
+    }
+
+    private fun startWorkerThread() {
         workerThread = Thread({
             while (!Thread.currentThread().isInterrupted) {
                 try {
-                    // Block until a job is signalled (permits may accumulate if
-                    // chunks arrive faster than processing — we drain only 1 permit
-                    // so we always re-read pendingJob for the absolute latest chunk).
-                    jobAvailable.acquire()
-                    // Drain any extra permits (new chunks arrived while we were busy)
-                    jobAvailable.drainPermits()
-
-                    val job = pendingJob.getAndSet(null) ?: continue
+                    val job = audioQueue.take()
                     if (!capturing.get()) continue
-
                     val ageMs = System.currentTimeMillis() - job.stampMs
-                    if (ageMs > STALE_THRESHOLD_MS) {
-                        Log.d(TAG, "Client-side stale drop (${ageMs}ms > ${STALE_THRESHOLD_MS}ms)")
-                        continue
+                    if (ageMs > STALE_MS) {
+                        Log.d(TAG, "Stale drop ${ageMs}ms"); continue
                     }
-
-                    sendToWhisper(job.pcm, job.stampMs)
+                    sendToWhisper(job.wav, job.stampMs)
                 } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
+                    Thread.currentThread().interrupt(); break
                 } catch (e: Exception) {
-                    Log.w(TAG, "Worker exception: ${e.message}")
+                    Log.w(TAG, "Worker: ${e.message}")
                 }
             }
-        }, "WhisperWorkerThread").apply {
-            isDaemon = true
-            priority = Thread.NORM_PRIORITY
-            start()
-        }
-
-        Log.d(TAG, "onCreate — foreground started, wakeLock acquired, latest-only worker started")
+        }, "WhisperWorkerThread").apply { isDaemon = true; priority = Thread.NORM_PRIORITY; start() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) {
-            Log.e(TAG, "onStartCommand received null intent — stopping")
-            stopSelf(); return START_NOT_STICKY
-        }
+        if (intent == null) { stopSelf(); return START_NOT_STICKY }
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
         val resultData: Intent? =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-            else
-                @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)
+            else @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)
 
         if (resultCode != Activity.RESULT_OK || resultData == null) {
-            Log.e(TAG, "No valid MediaProjection token")
             stopSelf(); return START_NOT_STICKY
         }
 
         try {
             val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(resultCode, resultData)
-        } catch (e: Exception) {
-            Log.e(TAG, "getMediaProjection failed: ${e.message}")
-            stopSelf(); return START_NOT_STICKY
-        }
+        } catch (e: Exception) { stopSelf(); return START_NOT_STICKY }
 
-        if (mediaProjection == null) {
-            Log.e(TAG, "MediaProjection is null after getMediaProjection()")
-            stopSelf(); return START_NOT_STICKY
-        }
+        if (mediaProjection == null) { stopSelf(); return START_NOT_STICKY }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    Log.d(TAG, "MediaProjection stopped externally")
-                    mainHandler.post { stopSelf() }
-                }
+                override fun onStop() { mainHandler.post { stopSelf() } }
             }, Handler(Looper.getMainLooper()))
         }
 
@@ -234,62 +184,36 @@ class SpeechCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy")
-        isRunning    = false
-        capturing.set(false)
-        reconnecting = false
-
+        isRunning = false; capturing.set(false); reconnecting = false
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         watchdogRunnable?.let  { mainHandler.removeCallbacks(it) }
-
-        captureThread?.interrupt()
-        captureThread = null
-
+        captureThread?.interrupt(); captureThread = null
+        workerThread?.interrupt(); workerThread = null
+        audioQueue.clear()
         try { audioRecord?.stop() }    catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
-
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
-
-        // Signal worker to stop
-        workerThread?.interrupt()
-        jobAvailable.release() // unblock acquire() if waiting
-        workerThread = null
-        pendingJob.set(null)
-
         mainHandler.removeCallbacksAndMessages(null)
-
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
-
         super.onDestroy()
     }
 
     private fun startCapture() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            OverlayService.updateText("", "Android 10 or newer required.")
-            stopSelf(); return
+            OverlayService.updateText("", "Android 10+ required."); stopSelf(); return
         }
-
         val projection = mediaProjection ?: run {
-            Log.e(TAG, "MediaProjection null at capture start")
-            OverlayService.updateText("", "Screen capture lost — tap STOP then START again.")
-            stopSelf(); return
+            OverlayService.updateText("", "Screen capture lost."); stopSelf(); return
         }
 
-        val minBuf = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
-            Log.e(TAG, "getMinBufferSize error: $minBuf")
-            OverlayService.updateText("", "Audio init failed — tap STOP then START.")
-            stopSelf(); return
-        }
+        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) { OverlayService.updateText("", "Audio init failed."); stopSelf(); return }
         val bufSize = maxOf(minBuf * 4, CHUNK_BYTES * 2)
 
-        val captureConfig = android.media.AudioPlaybackCaptureConfiguration
-            .Builder(projection)
+        val captureConfig = android.media.AudioPlaybackCaptureConfiguration.Builder(projection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
@@ -297,35 +221,30 @@ class SpeechCaptureService : Service() {
 
         val ar = try {
             AudioRecord.Builder()
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                        .build()
-                )
+                .setAudioFormat(AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build())
                 .setBufferSizeInBytes(bufSize)
                 .setAudioPlaybackCaptureConfig(captureConfig)
                 .build()
         } catch (e: Exception) {
-            Log.e(TAG, "AudioRecord.Builder failed: ${e.message}")
-            OverlayService.updateText("", "Audio setup failed: ${e.message}")
-            stopSelf(); return
+            OverlayService.updateText("", "Audio setup failed."); stopSelf(); return
         }
 
         if (ar.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord state=${ar.state} — not initialized")
-            ar.release()
-            OverlayService.updateText("", "Audio init failed — tap STOP then START.")
-            stopSelf(); return
+            ar.release(); OverlayService.updateText("", "Audio init failed."); stopSelf(); return
         }
         audioRecord = ar
+        chunksSentThisSession.set(0)
+        lastPushedHindi = ""
+        audioQueue.clear()
 
         capturing.set(true)
         ar.startRecording()
         updateNotification("Translating video audio to Hindi…")
         OverlayService.updateText("", "Listening to video audio…")
-        Log.d(TAG, "Capture started — chunk=${CHUNK_SECS}s stride=${STRIDE_SECS}s buf=$bufSize (latest-only dispatch)")
 
         captureThread = Thread({
             val window  = ByteArray(CHUNK_BYTES)
@@ -335,84 +254,69 @@ class SpeechCaptureService : Service() {
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
                 val rec  = audioRecord ?: break
                 val read = rec.read(readBuf, 0, readBuf.size)
-
-                if (read == AudioRecord.ERROR_INVALID_OPERATION ||
-                    read == AudioRecord.ERROR_BAD_VALUE
-                ) {
-                    Log.e(TAG, "AudioRecord.read error: $read")
-                    break
+                if (read <= 0 || read == AudioRecord.ERROR_INVALID_OPERATION || read == AudioRecord.ERROR_BAD_VALUE) {
+                    if (read < 0) break else continue
                 }
-                if (read <= 0) continue
 
                 var src = 0
                 while (src < read) {
-                    val space  = CHUNK_BYTES - filled
-                    val toCopy = minOf(read - src, space)
+                    val toCopy = minOf(read - src, CHUNK_BYTES - filled)
                     System.arraycopy(readBuf, src, window, filled, toCopy)
-                    filled += toCopy
-                    src    += toCopy
+                    filled += toCopy; src += toCopy
 
                     if (filled >= CHUNK_BYTES) {
-                        // FIX 1: Store as latest pending job — overwrites any
-                        // unprocessed job from a previous chunk. Worker picks up
-                        // the latest audio immediately.
                         if (!reconnecting) {
-                            val payload = window.copyOf(CHUNK_BYTES)
+                            val wav     = pcmToWav(window.copyOf(CHUNK_BYTES))
                             val stampMs = System.currentTimeMillis()
-                            pendingJob.set(AudioJob(payload, stampMs))
-                            jobAvailable.release()   // wake worker (non-blocking)
+                            val job     = AudioJob(wav, stampMs)
+
+                            // Bounded enqueue: drop oldest if full
+                            if (!audioQueue.offer(job)) {
+                                audioQueue.poll(); audioQueue.offer(job)
+                                Log.d(TAG, "Queue full — dropped oldest")
+                            }
+
+                            // FIX 2: Warm-up language lock on first chunk
+                            // Queue same chunk ×2 extra so server sees 3 identical
+                            // chunks and locks the language before displaying anything.
+                            if (chunksSentThisSession.incrementAndGet() == 1) {
+                                repeat(2) {
+                                    if (!audioQueue.offer(AudioJob(wav, stampMs))) {
+                                        audioQueue.poll(); audioQueue.offer(AudioJob(wav, stampMs))
+                                    }
+                                }
+                                Log.d(TAG, "Language warm-up: first chunk queued ×3")
+                            }
                         }
-                        filled = 0   // no overlap — fully reset window
+                        filled = 0
                     }
                 }
             }
             Log.d(TAG, "Capture thread ended")
-        }, "AudioCaptureThread").apply {
-            isDaemon = false
-            priority = Thread.NORM_PRIORITY
-            start()
-        }
+        }, "AudioCaptureThread").apply { isDaemon = false; priority = Thread.NORM_PRIORITY; start() }
     }
 
-    private fun sendToWhisper(pcmBytes: ByteArray, stampMs: Long) {
-        // Secondary stale guard (catches scheduling jitter)
+    private fun sendToWhisper(wavBytes: ByteArray, stampMs: Long) {
         val ageMs = System.currentTimeMillis() - stampMs
-        if (ageMs > STALE_THRESHOLD_MS) {
-            Log.d(TAG, "Pre-send stale drop (${ageMs}ms)")
-            return
-        }
+        if (ageMs > STALE_MS) { Log.d(TAG, "Pre-send stale ${ageMs}ms"); return }
 
         try {
-            val wavBytes = pcmToWav(pcmBytes)
-
             val conn = URL(WHISPER_URL).openConnection() as HttpURLConnection
             conn.requestMethod  = "POST"
             conn.setRequestProperty("Content-Type",   "audio/wav")
             conn.setRequestProperty("Content-Length", wavBytes.size.toString())
             conn.setRequestProperty("Connection",     "keep-alive")
             conn.doOutput       = true
-            conn.connectTimeout = 2_000   // ThreadingHTTPServer accepts instantly
-            conn.readTimeout    = 15_000  // 2s audio → Whisper ~3s + translate ~2s + margin
+            conn.connectTimeout = CONNECT_TIMEOUT_MS
+            conn.readTimeout    = READ_TIMEOUT_MS
 
             conn.outputStream.use { it.write(wavBytes) }
 
             val respCode = conn.responseCode
-            if (respCode != 200) {
-                Log.w(TAG, "Whisper HTTP $respCode")
-                handleWhisperFailure("HTTP $respCode")
-                return
-            }
+            if (respCode == 503) { Log.d(TAG, "Server busy 503 — skip"); return }
+            if (respCode != 200) { handleWhisperFailure("HTTP $respCode"); return }
 
-            val body      = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-            val json      = JSONObject(body)
-
-            // Server-side stale-drop — not an error, just no-op
-            val dropped = json.optBoolean("dropped", false)
-            if (dropped) {
-                Log.d(TAG, "Server dropped stale job — skipping")
-                return
-            }
-
+            val json       = JSONObject(conn.inputStream.bufferedReader(Charsets.UTF_8).readText())
             val hindiText  = json.optString("text",        "").trim()
             val srcText    = json.optString("source_text", "").trim()
             val lang       = json.optString("language",    "")
@@ -420,9 +324,7 @@ class SpeechCaptureService : Service() {
 
             consecutiveErrors.set(0)
             if (reconnecting) {
-                reconnecting       = false
-                reconnectBackoffMs = 2_000L
-                Log.d(TAG, "Whisper reconnected successfully")
+                reconnecting = false; reconnectBackoffMs = 2_000L
                 mainHandler.post {
                     updateNotification("Translating video audio to Hindi…")
                     OverlayService.updateText("", "✓ Reconnected — listening…")
@@ -432,17 +334,11 @@ class SpeechCaptureService : Service() {
             lastPushMs.set(System.currentTimeMillis())
             scheduleWatchdog()
 
-            // Only skip if IDENTICAL to last push. Do NOT skip if it is
-            // merely similar — even near-duplicate lines should display so we
-            // don't lose sentence-final words that only change slightly.
             if (hindiText.length < 2 || hindiText == lastPushedHindi) return
 
-            Log.d(TAG, "Whisper [$lang / ${(confidence * 100).toInt()}%] → HI: ${hindiText.take(60)}")
-
+            Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] HI: ${hindiText.take(80)}")
             lastPushedHindi = hindiText
-            latestOriginal  = srcText
-            latestEnglish   = srcText
-            latestHindi     = hindiText
+            latestOriginal  = srcText; latestEnglish = srcText; latestHindi = hindiText
 
             mainHandler.post {
                 OverlayService.updateText(srcText, hindiText)
@@ -450,18 +346,15 @@ class SpeechCaptureService : Service() {
             }
 
         } catch (e: Exception) {
-            Log.w(TAG, "Whisper call failed: ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(TAG, "Whisper failed: ${e.javaClass.simpleName}: ${e.message}")
             handleWhisperFailure(e.message ?: "unknown")
         }
     }
 
     private fun handleWhisperFailure(reason: String) {
         val errors = consecutiveErrors.incrementAndGet()
-        Log.w(TAG, "Whisper error #$errors: $reason")
-
         if (errors >= MAX_CONSECUTIVE_ERRORS && !reconnecting) {
             reconnecting = true
-            Log.w(TAG, "Entering reconnect mode after $errors consecutive errors")
             mainHandler.post {
                 updateNotification("Whisper disconnected — reconnecting…")
                 OverlayService.updateText("", "⚠ Reconnecting to Whisper…")
@@ -473,125 +366,72 @@ class SpeechCaptureService : Service() {
 
     private fun scheduleReconnectPoll() {
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
-
         val delay = reconnectBackoffMs
         reconnectBackoffMs = minOf(reconnectBackoffMs * 2, MAX_BACKOFF_MS)
-
-        val runnable = Runnable { pollWhisperHealth() }
-        reconnectRunnable = runnable
-        mainHandler.postDelayed(runnable, delay)
-        Log.d(TAG, "Next whisper health poll in ${delay}ms")
+        reconnectRunnable = Runnable { pollWhisperHealth() }
+        mainHandler.postDelayed(reconnectRunnable!!, delay)
     }
 
     private fun pollWhisperHealth() {
         if (!capturing.get()) return
-        // Run on the worker thread mechanism (post a health job directly)
         Thread({
             val alive = try {
                 val conn = URL(WHISPER_HEALTH).openConnection() as HttpURLConnection
-                conn.requestMethod  = "GET"
-                conn.connectTimeout = 1_500
-                conn.readTimeout    = 1_500
-                val code = conn.responseCode
-                conn.disconnect()
-                code == 200
+                conn.requestMethod = "GET"; conn.connectTimeout = 1_500; conn.readTimeout = 1_500
+                val code = conn.responseCode; conn.disconnect(); code == 200
             } catch (_: Exception) { false }
 
             if (alive) {
-                consecutiveErrors.set(0)
-                reconnecting       = false
-                reconnectBackoffMs = 2_000L
-                Log.d(TAG, "Whisper health check: server back online")
+                consecutiveErrors.set(0); reconnecting = false; reconnectBackoffMs = 2_000L
+                chunksSentThisSession.set(0) // reset warm-up after reconnect
                 mainHandler.post {
                     updateNotification("Translating video audio to Hindi…")
                     OverlayService.updateText("", "✓ Reconnected — listening…")
                     MainActivity.instance?.notifyWhisperReconnected()
                 }
-            } else {
-                mainHandler.post { scheduleReconnectPoll() }
-            }
+            } else { mainHandler.post { scheduleReconnectPoll() } }
         }, "HealthCheckThread").apply { isDaemon = true; start() }
     }
 
     private fun scheduleWatchdog() {
         watchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = Runnable {
+        watchdogRunnable = Runnable {
             if (!capturing.get() || reconnecting) return@Runnable
             val silenceMs = System.currentTimeMillis() - lastPushMs.get()
             if (silenceMs >= WATCHDOG_TIMEOUT_MS && lastPushMs.get() > 0) {
-                Log.w(TAG, "Watchdog fired — no translation for ${silenceMs}ms")
                 consecutiveErrors.set(MAX_CONSECUTIVE_ERRORS)
                 handleWhisperFailure("watchdog timeout")
-            } else {
-                scheduleWatchdog()
-            }
+            } else scheduleWatchdog()
         }
-        watchdogRunnable = runnable
-        mainHandler.postDelayed(runnable, WATCHDOG_TIMEOUT_MS)
+        mainHandler.postDelayed(watchdogRunnable!!, WATCHDOG_TIMEOUT_MS)
     }
 
     private fun pcmToWav(pcm: ByteArray): ByteArray {
-        val channels    = 1
-        val bitsPerSamp = 16
-        val byteRate    = SAMPLE_RATE * channels * bitsPerSamp / 8
-        val dataLen     = pcm.size
-        val riffChunkSz = dataLen + 36
-
-        val out = ByteArrayOutputStream(riffChunkSz + 8)
+        val channels = 1; val bits = 16
+        val byteRate = SAMPLE_RATE * channels * bits / 8
+        val out = ByteArrayOutputStream(pcm.size + 44)
         val dos = DataOutputStream(out)
-
-        dos.writeBytes("RIFF")
-        dos.writeIntLE(riffChunkSz)
-        dos.writeBytes("WAVE")
-        dos.writeBytes("fmt ")
-        dos.writeIntLE(16)
-        dos.writeShortLE(1)
-        dos.writeShortLE(channels)
-        dos.writeIntLE(SAMPLE_RATE)
-        dos.writeIntLE(byteRate)
-        dos.writeShortLE(channels * bitsPerSamp / 8)
-        dos.writeShortLE(bitsPerSamp)
-        dos.writeBytes("data")
-        dos.writeIntLE(dataLen)
-        dos.write(pcm)
-        dos.flush()
-        return out.toByteArray()
+        dos.writeBytes("RIFF"); dos.writeIntLE(pcm.size + 36)
+        dos.writeBytes("WAVEfmt "); dos.writeIntLE(16); dos.writeShortLE(1)
+        dos.writeShortLE(channels); dos.writeIntLE(SAMPLE_RATE); dos.writeIntLE(byteRate)
+        dos.writeShortLE(channels * bits / 8); dos.writeShortLE(bits)
+        dos.writeBytes("data"); dos.writeIntLE(pcm.size); dos.write(pcm)
+        dos.flush(); return out.toByteArray()
     }
-
-    private fun DataOutputStream.writeIntLE(v: Int) {
-        write(v         and 0xff)
-        write(v shr  8  and 0xff)
-        write(v shr 16  and 0xff)
-        write(v shr 24  and 0xff)
-    }
-    private fun DataOutputStream.writeShortLE(v: Int) {
-        write(v        and 0xff)
-        write(v shr 8  and 0xff)
-    }
+    private fun DataOutputStream.writeIntLE(v: Int) { write(v and 0xff); write(v shr 8 and 0xff); write(v shr 16 and 0xff); write(v shr 24 and 0xff) }
+    private fun DataOutputStream.writeShortLE(v: Int) { write(v and 0xff); write(v shr 8 and 0xff) }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel(
-                CHANNEL_ID,
-                "Internal Audio Capture",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { setShowBadge(false) }
-             .also { getSystemService(NotificationManager::class.java)
-                         .createNotificationChannel(it) }
+            NotificationChannel(CHANNEL_ID, "Internal Audio Capture", NotificationManager.IMPORTANCE_LOW)
+                .apply { setShowBadge(false) }
+                .also { getSystemService(NotificationManager::class.java).createNotificationChannel(it) }
         }
     }
-
     private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Caption Lens — Translating to Hindi")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setOngoing(true)
-            .setSilent(true)
-            .build()
-
-    private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_ID, buildNotification(text))
-    }
+            .setContentTitle("Caption Lens — Translating to Hindi").setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true).setSilent(true).build()
+    private fun updateNotification(text: String) =
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
 }
