@@ -68,20 +68,25 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        private const val CHUNK_SECS    = 2.0
-        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2
+        // 3s chunks — captures complete sentences before Whisper sees them.
+        // 2s was cutting sentences mid-word at natural pause points (300ms VAD),
+        // producing permanent half-sentences. 3s gives enough context for
+        // Whisper to see full grammatical units in most languages.
+        private const val CHUNK_SECS    = 3.0
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 48 000
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 96 000
 
-        // Bounded queue: 3 slots = 6s of audio max. Oldest dropped when full.
-        private const val QUEUE_CAPACITY = 3
+        // Queue capacity 4 = 12s of audio buffered max (4 × 3s chunks)
+        private const val QUEUE_CAPACITY = 4
 
-        // Stale threshold matches readTimeout
-        private const val STALE_MS           = 8_000L
+        // Stale threshold: 3s chunk + 2s Whisper + 1s translate + 6s margin
+        private const val STALE_MS           = 12_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        private const val READ_TIMEOUT_MS    = 8_000
+        // Read timeout: Whisper 3s chunk ~2s + LibreTranslate ~0.8s + 7s margin
+        private const val READ_TIMEOUT_MS    = 10_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
-        private const val WATCHDOG_TIMEOUT_MS    = 20_000L
+        private const val WATCHDOG_TIMEOUT_MS    = 25_000L
         private const val MAX_BACKOFF_MS         = 8_000L
     }
 
@@ -334,7 +339,11 @@ class SpeechCaptureService : Service() {
             lastPushMs.set(System.currentTimeMillis())
             scheduleWatchdog()
 
-            if (hindiText.length < 2 || hindiText == lastPushedHindi) return
+            // Only skip truly empty results (silence chunks).
+            // Do NOT dedup by exact text match — continuation sentences and
+            // repeated dialogue are real content that must be shown.
+            // The identical check was silently dropping half of all long sentences.
+            if (hindiText.length < 2) return
 
             Log.d(TAG, "[$lang/${(confidence*100).toInt()}%] HI: ${hindiText.take(80)}")
             lastPushedHindi = hindiText
