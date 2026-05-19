@@ -68,25 +68,23 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // 5s chunks — medium model takes ~18s to process.
-        // 5s chunks keep queue depth at ~3 max.
-        // Lag control on server drops old chunks so subtitles stay
-        // within ~18s of current speech — one processing window.
+        // 5s chunks for medium model
         private const val CHUNK_SECS    = 5.0
         private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 80 000
         private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 160 000
 
-        // Queue capacity 3 — medium model is slow, keep queue small
-        // Lag control on server handles overflow by dropping old chunks
-        private const val QUEUE_CAPACITY = 3
+        // Keep queue small — medium model is sequential, one at a time
+        private const val QUEUE_CAPACITY = 2
 
-        // medium model: ~18s Whisper + ~0.3s CT2 + 12s margin = 30s
-        private const val STALE_MS           = 30_000L
+        // medium model: ~18s processing + 27s margin = 45s
+        // READ_TIMEOUT must be < server done_event.wait(45s)
+        // so server always responds before client gives up
+        private const val STALE_MS           = 45_000L
         private const val CONNECT_TIMEOUT_MS = 3_000
-        private const val READ_TIMEOUT_MS    = 30_000
+        private const val READ_TIMEOUT_MS    = 42_000
 
-        private const val MAX_CONSECUTIVE_ERRORS = 5
-        private const val WATCHDOG_TIMEOUT_MS    = 25_000L
+        private const val MAX_CONSECUTIVE_ERRORS = 3
+        private const val WATCHDOG_TIMEOUT_MS    = 60_000L
         private const val MAX_BACKOFF_MS         = 8_000L
     }
 
