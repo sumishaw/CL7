@@ -288,18 +288,15 @@ class OverlayService : Service() {
             val sw = resources.displayMetrics.widthPixels
             val tv = TextView(this).apply {
                 typeface  = Typeface.DEFAULT_BOLD
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
                 setTextColor(Color.WHITE)
-                setShadowLayer(10f, 0f, 2f, Color.BLACK)
+                // Strong multi-layer shadow for readability without background box
+                setShadowLayer(12f, 0f, 3f, Color.BLACK)
                 maxLines  = 2
                 setLineSpacing(dp(4).toFloat(), 1f)
                 ellipsize = android.text.TextUtils.TruncateAt.END
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    shape        = android.graphics.drawable.GradientDrawable.RECTANGLE
-                    cornerRadius = dp(10).toFloat()
-                    setColor(Color.argb(190, 0, 0, 0))
-                }
-                setPadding(dp(14), dp(10), dp(14), dp(10))
+                background = null   // no background box
+                setPadding(dp(8), dp(4), dp(8), dp(4))
                 alpha = 0f
                 text  = ""
             }
