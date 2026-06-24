@@ -61,7 +61,7 @@ object HindiTtsService {
 
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
     data class FetchItem(val text: String, val gender: String, val speed: Float)
-    data class PlayItem (val wav: ByteArray, val durMs: Long)
+    data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
@@ -157,7 +157,7 @@ object HindiTtsService {
                         val nch = readShort(wav, 22).coerceAtLeast(1)
                         val bit = readShort(wav, 34).coerceAtLeast(8)
                         val dur = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nch * (bit / 8))
-                        playQueue.offer(PlayItem(wav, dur))
+                        playQueue.offer(PlayItem(item.text, wav, dur))
                     } else {
                         Log.w(TAG, "Empty WAV — is hindi_tts_server.py running? Start: python3 ~/hindi_tts_server.py &")
                     }
@@ -175,9 +175,17 @@ object HindiTtsService {
                 if (!enabled) continue
                 try {
                     isSpeaking = true
-                    requestAudioFocus()       // pauses video → LC has nothing to caption
+                    requestAudioFocus()
+                    // Show subtitle exactly when TTS starts speaking
+                    withContext(Dispatchers.Main) {
+                        OverlayService.showTtsText(item.text)
+                    }
                     playWav(item.wav, item.durMs)
-                    releaseAudioFocus()       // video resumes
+                    // Clear subtitle when TTS finishes
+                    withContext(Dispatchers.Main) {
+                        OverlayService.clearTtsText()
+                    }
+                    releaseAudioFocus()
                     speakingUntilMs = System.currentTimeMillis() + 800L
                 } catch (e: Exception) {
                     Log.e(TAG, "Play: ${e.message}")
