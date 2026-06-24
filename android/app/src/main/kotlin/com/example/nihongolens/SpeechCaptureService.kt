@@ -47,6 +47,9 @@ class SpeechCaptureService : Service() {
         @Volatile var latestEnglish  = ""
         @Volatile var latestHindi    = ""
 
+        // Shared MediaProjection — GenderAnalyzer uses this instead of creating its own
+        @Volatile var sharedProjection: MediaProjection? = null
+
         private const val TAG            = "SpeechCapture"
         private const val SAMPLE_RATE    = 16_000
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
@@ -143,6 +146,9 @@ class SpeechCaptureService : Service() {
 
         if (mediaProjection == null) { stopSelf(); return START_NOT_STICKY }
 
+        // Share projection for GenderAnalyzer — same token, no second getMediaProjection() call
+        sharedProjection = mediaProjection
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() { mainHandler.post { stopSelf() } }
@@ -168,6 +174,7 @@ class SpeechCaptureService : Service() {
         audioRecord = null
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
+        sharedProjection = null
         mainHandler.removeCallbacksAndMessages(null)
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
