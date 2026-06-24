@@ -265,7 +265,7 @@ class LiveCaptionReader : AccessibilityService() {
     private var sentenceBuffer      = ""
     private var lastBufferEnqueued  = ""   // tracks last text actually sent to worker
     private var lastLCChangeMs      = 0L
-    private val SENTENCE_SILENCE_MS = 1_200L
+    private val SENTENCE_SILENCE_MS = 600L
     private var sentenceTimerJob: Job? = null
     private var lastEnqueuedWordCount = 0
     private var lastEnqueuedText      = ""
@@ -296,15 +296,32 @@ class LiveCaptionReader : AccessibilityService() {
         // Always cap at 12 words for translation — keeps TTS under 3s per chunk
         val toTranslate = if (wordCount > 12) words.take(12).joinToString(" ") else trimmed
 
-        // TRIGGER 1: ends with sentence punctuation → translate after 200ms settle
-        val endsWithPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
-                            trimmed.endsWith("!") || trimmed.endsWith("。") ||
-                            trimmed.endsWith("？") || trimmed.endsWith("！") ||
-                            trimmed.endsWith("…")
-        if (endsWithPunct && wordCount >= 3) {
+        // TRIGGER 1a: strong punctuation → translate immediately (100ms settle)
+        val endsWithHardPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
+                                trimmed.endsWith("!") || trimmed.endsWith("。") ||
+                                trimmed.endsWith("？") || trimmed.endsWith("！") ||
+                                trimmed.endsWith("…")
+        if (endsWithHardPunct && wordCount >= 3) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(200)
+                delay(100)
+                val t = capWords(sentenceBuffer.trim(), 12)
+                if (t.isNotBlank() && t != lastEnqueuedText) {
+                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                    enqueue(t); sentenceBuffer = ""
+                }
+            }
+            return
+        }
+
+        // TRIGGER 1b: soft punctuation (,;:-) → translate after 350ms if 5+ words
+        val endsWithSoftPunct = trimmed.endsWith(",") || trimmed.endsWith(";") ||
+                                trimmed.endsWith(":") || trimmed.endsWith(" -") ||
+                                trimmed.endsWith("—")
+        if (endsWithSoftPunct && wordCount >= 5) {
+            sentenceTimerJob?.cancel(); pendingJob?.cancel()
+            pendingJob = scope.launch {
+                delay(350)
                 val t = capWords(sentenceBuffer.trim(), 12)
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
@@ -316,7 +333,7 @@ class LiveCaptionReader : AccessibilityService() {
 
         // TRIGGER 2: grew by 6+ words since last translation
         val grown = wordCount - lastEnqueuedWordCount
-        if (grown >= 6 && wordCount >= 6) {
+        if (grown >= 4 && wordCount >= 4) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(200)  // brief settle for word correction
