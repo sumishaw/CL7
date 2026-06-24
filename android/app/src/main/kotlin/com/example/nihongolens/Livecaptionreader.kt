@@ -285,7 +285,7 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceBuffer = text
         lastLCChangeMs = System.currentTimeMillis()
         val trimmed = text.trim()
-        val currentWords = trimmed.split(Regex("\s+")).filter { it.isNotBlank() }
+        val currentWords = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
         val newWordCount = currentWords.size
 
         // TRIGGER 1: sentence-ending punctuation → translate after brief settle
@@ -298,7 +298,7 @@ class LiveCaptionReader : AccessibilityService() {
             pendingJob = scope.launch {
                 delay(250)
                 val buf = capWords(sentenceBuffer.trim(), 20)
-                val bufWords = buf.split(Regex("\s+")).size
+                val bufWords = buf.split(Regex("\\s+")).size
                 if (buf.isNotBlank() && buf != lastBufferEnqueued && bufWords > lastEnqueuedWordCount) {
                     lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
                     enqueue(buf); sentenceBuffer = ""
@@ -315,7 +315,7 @@ class LiveCaptionReader : AccessibilityService() {
             pendingJob = scope.launch {
                 delay(300)  // brief settle for word corrections
                 val buf = capWords(sentenceBuffer.trim(), 20)
-                val bufWords = buf.split(Regex("\s+")).size
+                val bufWords = buf.split(Regex("\\s+")).size
                 if (buf.isNotBlank() && bufWords > lastEnqueuedWordCount) {
                     lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
                     enqueue(buf); sentenceBuffer = ""
@@ -329,7 +329,7 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
             val buf = capWords(sentenceBuffer.trim(), 20)
-            val bufWords = buf.split(Regex("\s+")).size
+            val bufWords = buf.split(Regex("\\s+")).size
             if (buf.isNotBlank() && buf != lastBufferEnqueued && bufWords > lastEnqueuedWordCount) {
                 CaptionLogger.log(TAG, "SILENCE translate")
                 lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
@@ -340,7 +340,7 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun capWords(text: String, maxWords: Int): String {
-        val words = text.trim().split(Regex("\s+"))
+        val words = text.trim().split(Regex("\\s+"))
         return if (words.size <= maxWords) text.trim()
                else words.take(maxWords).joinToString(" ")
     }
