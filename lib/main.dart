@@ -74,6 +74,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String  _genderDetected   = 'male';
   String  _genderSelected   = 'auto';
   bool    _genderAnalyzerOn = false;
+  String  _genderStatus     = 'never started';
   int     _skippedCount     = 0;
   int     _translatedCount  = 0;
 
@@ -277,6 +278,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _genderDetected   = gst['detected']?.toString()  ?? 'male';
             _genderSelected   = gst['selected']?.toString()  ?? 'auto';
             _genderAnalyzerOn = gst['enabled'] as bool? ?? false;
+            _genderStatus     = gst['status']?.toString()    ?? 'unknown';
           }
         });
         if (_logTab == 1 && _logScroll.hasClients) {
@@ -449,9 +451,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ]),
             ),
             const SizedBox(width: 8),
-            // Translation counter
+            // GenderAnalyzer status
+            Expanded(
+              child: Text(
+                _genderStatus,
+                style: TextStyle(
+                  color: _genderAnalyzerOn ? Colors.greenAccent.withValues(alpha: 0.7) : Colors.redAccent.withValues(alpha: 0.7),
+                  fontSize: 10,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             Text(
-              'Trans: $_translatedCount  Skip: $_skippedCount',
+              'T:$_translatedCount S:$_skippedCount',
               style: const TextStyle(color: Colors.white38, fontSize: 11),
             ),
             const Spacer(),
