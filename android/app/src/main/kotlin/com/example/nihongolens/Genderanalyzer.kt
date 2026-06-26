@@ -11,39 +11,83 @@ import kotlinx.coroutines.*
 import kotlin.math.*
 
 /**
- * GenderAnalyzer v9 — Gender + Emotion detection from USAGE_MEDIA internal audio.
- * All 23 emotion/voice types detected acoustically. No mic. No Visualizer.
+ * GenderAnalyzer v10 — Full Voice Profile extraction from USAGE_MEDIA internal audio.
+ *
+ * Extracts per-frame acoustic features and maintains a smoothed VoiceProfile
+ * that is used by HindiTtsService to replicate the original speaker's voice
+ * characteristics in the Hindi TTS output.
+ *
+ * VOICE PROFILE PARAMETERS (all continuously updated):
+ *   speed       — speaking pace ratio vs baseline (0.6–1.8)
+ *   pitch       — F0 ratio vs speaker baseline (0.75–1.35)
+ *   volume      — normalised RMS energy (0.4–2.0)
+ *   breathiness — air leakage through cords; 1−HNR (0=clear, 1=breathy)
+ *   roughness   — frame-to-frame F0 jitter (0=smooth, 1=very rough)
+ *   pitchSlope  — intonation direction: "rising", "flat", "falling"
+ *   emotion     — one of 23 voice types detected from the above features
  */
 object GenderAnalyzer {
 
     private const val TAG           = "GenderAnalyzer"
     private const val SR            = 16_000
-    private const val WIN           = 2048
-    private const val F0_VOICE_MIN  = 85f    // below = music bass, not voice
-    private const val F0_FEMALE_MIN = 165f   // male: 85–164Hz, female: 165–400Hz
-    private const val F0_VOICE_MAX  = 400f   // above = falsetto/noise
+    private const val WIN           = 2048        // 128 ms analysis window
+    private const val F0_VOICE_MIN  = 85f         // below = music bass, not voice
+    private const val F0_FEMALE_MIN = 165f         // male: 85–164 Hz, female: 165–400 Hz
+    private const val F0_VOICE_MAX  = 400f         // above = noise/harmonics
     private const val YIN_THRESH    = 0.22f
     private const val RMS_FLOOR     = 80f
-    private const val HIST          = 3      // 2/3 majority to switch gender
+    private const val HIST          = 3            // 2/3 majority to switch gender
+    private const val PROFILE_SMOOTH = 8          // frames to smooth voice profile
 
-    @Volatile var enabled       = false
-    @Volatile var lastStatus    = "waiting for screen capture permission"
-    @Volatile var detectedEmotion: HindiTtsService.Emotion = HindiTtsService.Emotion.NEUTRAL
+    // ── VoiceProfile ──────────────────────────────────────────────────────────
+    /**
+     * Continuously updated snapshot of the speaker's voice characteristics.
+     * Smoothed over PROFILE_SMOOTH frames to avoid jitter.
+     * Read by HindiTtsService.speak() at enqueue time.
+     */
+    data class VoiceProfile(
+        val speed:       Float  = 1.00f,  // 0.6–1.8   speaking pace
+        val pitch:       Float  = 1.00f,  // 0.75–1.35 F0 ratio vs baseline
+        val volume:      Float  = 1.00f,  // 0.4–2.0   normalised energy
+        val breathiness: Float  = 0.20f,  // 0–1       1-HNR (breathy = high)
+        val roughness:   Float  = 0.05f,  // 0–1       F0 jitter (rough = high)
+        val pitchSlope:  String = "flat", // "rising" | "flat" | "falling"
+        val emotion:     HindiTtsService.Emotion = HindiTtsService.Emotion.NEUTRAL
+    )
 
-    private val history        = ArrayDeque<HindiTtsService.Gender>()
+    @Volatile var enabled        = false
+    @Volatile var lastStatus     = "waiting for screen capture permission"
+    @Volatile var currentProfile = VoiceProfile()
+
+    private val genderHistory  = ArrayDeque<HindiTtsService.Gender>()
     private val emotionHistory = ArrayDeque<HindiTtsService.Emotion>()
     private val accum          = ShortArray(WIN)
     private var accumFill      = 0
 
+    // Smoothing buffers for each profile dimension
+    private val speedBuf       = FloatArray(PROFILE_SMOOTH) { 1.0f }
+    private val pitchBuf       = FloatArray(PROFILE_SMOOTH) { 1.0f }
+    private val volumeBuf      = FloatArray(PROFILE_SMOOTH) { 1.0f }
+    private val breathBuf      = FloatArray(PROFILE_SMOOTH) { 0.2f }
+    private val roughBuf       = FloatArray(PROFILE_SMOOTH) { 0.05f }
+    private var bufIdx         = 0
+
+    // Tracking state
+    private var prevF0         = 0f
+    private val f0Ring         = FloatArray(8)   // recent F0 values for jitter
+    private var f0RingIdx      = 0
+    private var speakerF0Base  = 0f              // running F0 mean for pitch ratio
+    private var speakerF0Count = 0
+    private var frameCount     = 0
+    private var analyzeCount   = 0
+
+    // Silence tracking for pace estimation
+    private var lastVoicedMs   = 0L
+    private var silenceRatio   = 0.5f
+
     private val scope          = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var captureJob:    Job?         = null
     private var captureRec:    AudioRecord? = null
-
-    private var prevF0      = 0f
-    private var f0History   = FloatArray(8)
-    private var f0HistIdx   = 0
-    private var frameCount  = 0
-    private var analyzeCount = 0
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -51,11 +95,10 @@ object GenderAnalyzer {
         if (enabled) return
         if (projection == null) {
             lastStatus = "no projection — grant screen capture permission"
-            CaptionLogger.log(TAG, "start() — no projection")
-            return
+            CaptionLogger.log(TAG, "start() — no projection"); return
         }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            lastStatus = "API < Q — not supported"; return
+            lastStatus = "API < Q"; return
         }
         stop()
         captureJob = scope.launch { captureLoop(projection) }
@@ -67,8 +110,8 @@ object GenderAnalyzer {
         try { captureRec?.stop()    } catch (_: Exception) {}
         try { captureRec?.release() } catch (_: Exception) {}
         captureRec = null
-        history.clear(); emotionHistory.clear()
-        accumFill = 0
+        genderHistory.clear(); emotionHistory.clear()
+        accumFill = 0; speakerF0Base = 0f; speakerF0Count = 0
         if (lastStatus != "waiting for screen capture permission")
             CaptionLogger.log(TAG, "stopped")
     }
@@ -83,7 +126,7 @@ object GenderAnalyzer {
                 .build()
         } catch (e: Exception) {
             enabled = false; lastStatus = "config failed: ${e.message}"
-            CaptionLogger.log(TAG, "config failed: ${e.message}"); return@withContext
+            CaptionLogger.log(TAG, "config: ${e.message}"); return@withContext
         }
 
         val minBuf = AudioRecord.getMinBufferSize(
@@ -102,34 +145,31 @@ object GenderAnalyzer {
                 .build()
         } catch (e: Exception) {
             enabled = false; lastStatus = "AudioRecord failed: ${e.message}"
-            CaptionLogger.log(TAG, "AudioRecord failed: ${e.message}"); return@withContext
+            CaptionLogger.log(TAG, "AudioRecord: ${e.message}"); return@withContext
         }
 
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
             enabled = false; rec.release()
-            lastStatus = "AudioRecord state=${rec.state}"
-            CaptionLogger.log(TAG, "AudioRecord not initialized"); return@withContext
+            lastStatus = "AudioRecord state=${rec.state}"; return@withContext
         }
 
         captureRec = rec; enabled = true
         lastStatus = "capturing USAGE_MEDIA SR=${SR}Hz"
         rec.startRecording()
-        CaptionLogger.log(TAG, ">>> INTERNAL AUDIO CAPTURE STARTED SR=${SR}Hz <<<")
+        CaptionLogger.log(TAG, ">>> VOICE PROFILE CAPTURE STARTED SR=${SR}Hz <<<")
 
-        val buf = ByteArray(WIN * 2)
-        var readCount = 0
+        val buf = ByteArray(WIN * 2); var reads = 0
         try {
             while (currentCoroutineContext().isActive && enabled) {
                 val n = rec.read(buf, 0, buf.size)
                 when {
-                    n > 0  -> { readCount++; if (readCount == 1) CaptionLogger.log(TAG, "FIRST read: $n bytes — audio flowing!"); ingest(buf, n) }
-                    n < 0  -> { CaptionLogger.log(TAG, "read error=$n"); break }
+                    n > 0 -> { reads++; if (reads == 1) CaptionLogger.log(TAG, "FIRST read — media audio flowing!"); ingest(buf, n) }
+                    n < 0 -> { CaptionLogger.log(TAG, "read error=$n"); break }
                 }
             }
         } finally {
             try { rec.stop(); rec.release() } catch (_: Exception) {}
             captureRec = null; enabled = false
-            CaptionLogger.log(TAG, "captureLoop ended reads=$readCount")
         }
     }
 
@@ -146,19 +186,33 @@ object GenderAnalyzer {
         }
     }
 
-    // ── YIN pitch + emotion features ─────────────────────────────────────────
+    // ── Feature extraction ────────────────────────────────────────────────────
 
     private fun analyze() {
         analyzeCount++
+        val now = System.currentTimeMillis()
+
+        // RMS (volume)
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
-        if (rms < RMS_FLOOR) return
+        val rmsNorm = (rms / 3000f).coerceIn(0.1f, 3.0f)
 
+        // Silence / pace tracking
+        if (rms < RMS_FLOOR) {
+            val silMs = if (lastVoicedMs > 0) (now - lastVoicedMs) else 0L
+            // Long silence = end of phrase → pace feels slower
+            silenceRatio = (silenceRatio * 0.9f + (if (silMs > 400) 1f else 0f) * 0.1f)
+                .coerceIn(0f, 1f)
+            prevF0 = 0f
+            return
+        }
+        lastVoicedMs = now
+
+        // YIN pitch detection
         val tauMin = (SR / 300).coerceAtLeast(1)
         val tauMax = (SR / 60).coerceAtMost(WIN / 2 - 1)
         val half   = WIN / 2
-
         val d = FloatArray(tauMax + 1)
         for (tau in 1..tauMax) {
             var s = 0f
@@ -168,150 +222,154 @@ object GenderAnalyzer {
             }
             d[tau] = s
         }
-
         val c = FloatArray(tauMax + 1); c[0] = 1f; var rs = 0f
-        for (tau in 1..tauMax) {
-            rs += d[tau]; c[tau] = if (rs > 0f) d[tau] * tau / rs else 1f
-        }
+        for (tau in 1..tauMax) { rs += d[tau]; c[tau] = if (rs > 0f) d[tau] * tau / rs else 1f }
 
-        var tau = tauMin; var minCmndf = 1f
+        var minCmndf = 1f; var tau = tauMin
         while (tau < tauMax - 1) {
             if (c[tau] < minCmndf) minCmndf = c[tau]
             if (c[tau] < YIN_THRESH) {
                 val best = if (tau + 1 < tauMax && c[tau + 1] < c[tau]) tau + 1 else tau
-                onPitch(SR.toFloat() / best, rms, 1f - minCmndf)
+                onVoicedFrame(SR.toFloat() / best, rmsNorm, 1f - minCmndf, now)
                 return
             }
             tau++
         }
-        if (analyzeCount % 15 == 0) {
-            var mv = 1f; var mt = tauMin
-            for (t in tauMin until tauMax) if (c[t] < mv) { mv = c[t]; mt = t }
-            CaptionLogger.log(TAG, "noPitch rms=${rms.toInt()} minCMNDF=${"%.3f".format(mv)} f0est=${SR/mt}Hz")
-        }
+        // Unvoiced voiced frame — still update volume smoothing
+        updateSmoothing(null, rmsNorm, 0f, 0f)
     }
 
-    // ── Gender + Emotion classification ──────────────────────────────────────
+    // ── Per-voiced-frame processing ───────────────────────────────────────────
 
-    private fun onPitch(f0: Float, rms: Float, hnr: Float) {
+    private fun onVoicedFrame(f0: Float, rmsNorm: Float, hnr: Float, nowMs: Long) {
         frameCount++
 
-        // ── VOICE RANGE GATE — filters music bass (<85Hz) and noise (>400Hz) ──
+        // Voice range gate — ignore music bass and noise
         if (f0 < F0_VOICE_MIN || f0 > F0_VOICE_MAX) {
-            if (frameCount % 15 == 0)
-                CaptionLogger.log(TAG, "IGNORE F0=${f0.toInt()}Hz outside voice ${F0_VOICE_MIN.toInt()}–${F0_VOICE_MAX.toInt()}Hz")
+            if (frameCount % 20 == 0)
+                CaptionLogger.log(TAG, "IGNORE F0=${f0.toInt()}Hz outside ${F0_VOICE_MIN.toInt()}–${F0_VOICE_MAX.toInt()}Hz")
             return
         }
 
         // ── GENDER ────────────────────────────────────────────────────────────
         val gender = if (f0 >= F0_FEMALE_MIN) HindiTtsService.Gender.FEMALE
                      else                      HindiTtsService.Gender.MALE
-
-        history.addLast(gender)
-        if (history.size > HIST) history.removeFirst()
-        val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
-        val maj    = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
-                     else                            HindiTtsService.Gender.MALE
-
+        genderHistory.addLast(gender)
+        if (genderHistory.size > HIST) genderHistory.removeFirst()
+        val maj = if (genderHistory.count { it == HindiTtsService.Gender.FEMALE } > genderHistory.size / 2)
+            HindiTtsService.Gender.FEMALE else HindiTtsService.Gender.MALE
         if (maj != HindiTtsService.detectedGender) {
             HindiTtsService.detectedGender = maj
             HindiTtsService.spokenTokens.clear()
-            lastStatus = "MEDIA → $maj F0=${f0.toInt()}Hz"
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
         }
 
-        // ── EMOTION FEATURES ──────────────────────────────────────────────────
-        val f0Slope  = if (prevF0 > 0f) (f0 - prevF0) / prevF0 else 0f
+        // ── PITCH RATIO vs speaker baseline ───────────────────────────────────
+        // Track per-gender F0 baseline via exponential moving average
+        speakerF0Base = if (speakerF0Base == 0f) f0
+                        else speakerF0Base * 0.97f + f0 * 0.03f
+        speakerF0Count++
+        val pitchRatio = if (speakerF0Base > 0f)
+            (f0 / speakerF0Base).coerceIn(0.75f, 1.35f) else 1.0f
+
+        // ── F0 SLOPE (intonation) ─────────────────────────────────────────────
+        val f0Slope = if (prevF0 > 0f) (f0 - prevF0) / prevF0 else 0f
         prevF0 = f0
-        f0History[f0HistIdx % f0History.size] = f0; f0HistIdx++
-        val validF0   = f0History.filter { it > 0f }
-        val f0Mean    = if (validF0.isEmpty()) f0 else validF0.average().toFloat()
-        val f0Jitter  = if (validF0.size < 2) 0f else
-            validF0.map { abs(it - f0Mean) }.average().toFloat() / f0Mean.coerceAtLeast(1f)
-        val rmsNorm   = (rms / 3000f).coerceIn(0f, 3f)
-
-        // ── 23-TYPE EMOTION CLASSIFIER ────────────────────────────────────────
-        // Priority: Rhythmic > Intense > Breathive/Warm > Basic
-        val emotion: HindiTtsService.Emotion = when {
-
-            // RHYTHMIC & EXPRESSIVE
-            f0Slope > 0.20f && rmsNorm > 2.0f && f0Jitter > 0.18f ->
-                HindiTtsService.Emotion.GASPING
-            f0Jitter > 0.22f && rmsNorm > 1.8f && f0 > f0Mean * 1.02f ->
-                HindiTtsService.Emotion.PANTING
-            f0 < f0Mean * 0.85f && f0Jitter < 0.06f && rmsNorm in 0.3f..1.0f && hnr > 0.4f ->
-                HindiTtsService.Emotion.MOANING
-            f0Slope < -0.12f && rmsNorm < 0.6f && hnr > 0.3f ->
-                HindiTtsService.Emotion.SIGHING
-
-            // INTENSE & PHYSIOLOGICAL
-            f0 > f0Mean * 1.12f && rmsNorm > 1.3f && f0Jitter > 0.10f && hnr < 0.5f ->
-                HindiTtsService.Emotion.STRAINED
-            f0 < f0Mean * 0.80f && hnr < 0.30f && f0Jitter > 0.10f ->
-                HindiTtsService.Emotion.GRAVELLY
-            hnr < 0.35f && rmsNorm > 1.0f && f0Jitter > 0.08f ->
-                HindiTtsService.Emotion.RASPY
-            hnr < 0.45f && rmsNorm in 0.7f..1.5f && f0Jitter in 0.05f..0.12f ->
-                HindiTtsService.Emotion.HUSKY
-
-            // BASIC HIGH-ENERGY
-            f0Slope > 0.15f && rmsNorm > 0.8f ->
-                HindiTtsService.Emotion.SURPRISED
-            rmsNorm > 1.4f && hnr < 0.5f ->
-                HindiTtsService.Emotion.ANGRY
-            f0 > f0Mean * 1.05f && f0Jitter > 0.12f ->
-                HindiTtsService.Emotion.FEARFUL
-
-            // BREATHIVE & LOW-INTENSITY
-            rmsNorm < 0.25f && hnr < 0.25f ->
-                HindiTtsService.Emotion.WHISPERY
-            f0 < f0Mean * 0.88f && rmsNorm < 0.4f && hnr < 0.4f ->
-                HindiTtsService.Emotion.MURMURED
-            rmsNorm < 0.35f && hnr < 0.40f && f0Jitter < 0.06f ->
-                HindiTtsService.Emotion.HUSHED
-            hnr < 0.40f && rmsNorm in 0.2f..0.8f && f0Jitter < 0.07f ->
-                HindiTtsService.Emotion.BREATHY
-
-            // WARM & AFFECTIONATE
-            f0 < f0Mean * 0.92f && hnr > 0.65f && f0Jitter < 0.05f && rmsNorm < 0.9f ->
-                HindiTtsService.Emotion.SULTRY
-            rmsNorm < 0.45f && hnr > 0.60f && f0Jitter < 0.05f ->
-                HindiTtsService.Emotion.TENDER
-            f0 < f0Mean * 0.97f && hnr > 0.70f && f0Jitter < 0.04f ->
-                HindiTtsService.Emotion.VELVETY
-            hnr > 0.65f && f0Jitter < 0.05f && rmsNorm in 0.4f..1.1f ->
-                HindiTtsService.Emotion.WARM
-
-            // BASIC EMOTIONAL STATES
-            f0 > f0Mean * 1.08f && f0Jitter < 0.08f && rmsNorm > 0.6f && hnr > 0.6f ->
-                HindiTtsService.Emotion.HAPPY
-            f0 < f0Mean * 0.93f && abs(f0Slope) < 0.05f && rmsNorm < 0.7f ->
-                HindiTtsService.Emotion.SAD
-            f0Slope < -0.10f && rmsNorm < 0.9f && hnr < 0.45f ->
-                HindiTtsService.Emotion.DISGUST
-
-            else -> HindiTtsService.Emotion.NEUTRAL
+        val pitchSlope = when {
+            f0Slope >  0.06f -> "rising"
+            f0Slope < -0.06f -> "falling"
+            else             -> "flat"
         }
 
-        // Smooth over 7 frames — prevent rapid flicker
+        // ── F0 JITTER (roughness) ─────────────────────────────────────────────
+        f0Ring[f0RingIdx % f0Ring.size] = f0; f0RingIdx++
+        val validF0  = f0Ring.filter { it > 0f }
+        val f0Mean   = if (validF0.isEmpty()) f0 else validF0.average().toFloat()
+        val roughness = if (validF0.size < 2) 0.05f else
+            (validF0.map { abs(it - f0Mean) }.average().toFloat() / f0Mean.coerceAtLeast(1f))
+                .coerceIn(0f, 1f)
+
+        // ── BREATHINESS (1 - HNR) ─────────────────────────────────────────────
+        val breathiness = (1f - hnr).coerceIn(0f, 1f)
+
+        // ── SPEAKING PACE ─────────────────────────────────────────────────────
+        // Pace = inverse of silence ratio + F0 slope activity
+        // High silence ratio = slower speaker; low = faster
+        val pace = (1.0f - silenceRatio * 0.4f).coerceIn(0.6f, 1.8f)
+
+        // ── UPDATE SMOOTHING BUFFERS ──────────────────────────────────────────
+        updateSmoothing(pitchRatio, rmsNorm, breathiness, roughness)
+        val idx = bufIdx % PROFILE_SMOOTH
+        speedBuf[idx] = pace
+        bufIdx++
+
+        // ── EMOTION DETECTION ─────────────────────────────────────────────────
+        val emotion: HindiTtsService.Emotion = when {
+            f0Slope > 0.20f && rmsNorm > 2.0f && roughness > 0.18f     -> HindiTtsService.Emotion.GASPING
+            roughness > 0.22f && rmsNorm > 1.8f && f0 > f0Mean * 1.02f -> HindiTtsService.Emotion.PANTING
+            f0 < f0Mean * 0.85f && roughness < 0.06f && rmsNorm in 0.3f..1.0f && hnr > 0.4f -> HindiTtsService.Emotion.MOANING
+            f0Slope < -0.12f && rmsNorm < 0.6f && hnr > 0.3f           -> HindiTtsService.Emotion.SIGHING
+            f0 > f0Mean * 1.12f && rmsNorm > 1.3f && roughness > 0.10f && hnr < 0.5f -> HindiTtsService.Emotion.STRAINED
+            f0 < f0Mean * 0.80f && hnr < 0.30f && roughness > 0.10f    -> HindiTtsService.Emotion.GRAVELLY
+            hnr < 0.35f && rmsNorm > 1.0f && roughness > 0.08f         -> HindiTtsService.Emotion.RASPY
+            hnr < 0.45f && rmsNorm in 0.7f..1.5f && roughness in 0.05f..0.12f -> HindiTtsService.Emotion.HUSKY
+            f0Slope > 0.15f && rmsNorm > 0.8f                          -> HindiTtsService.Emotion.SURPRISED
+            rmsNorm > 1.4f && hnr < 0.5f                               -> HindiTtsService.Emotion.ANGRY
+            f0 > f0Mean * 1.05f && roughness > 0.12f                   -> HindiTtsService.Emotion.FEARFUL
+            rmsNorm < 0.25f && hnr < 0.25f                             -> HindiTtsService.Emotion.WHISPERY
+            f0 < f0Mean * 0.88f && rmsNorm < 0.4f && hnr < 0.4f       -> HindiTtsService.Emotion.MURMURED
+            rmsNorm < 0.35f && hnr < 0.40f && roughness < 0.06f        -> HindiTtsService.Emotion.HUSHED
+            hnr < 0.40f && rmsNorm in 0.2f..0.8f && roughness < 0.07f -> HindiTtsService.Emotion.BREATHY
+            f0 < f0Mean * 0.92f && hnr > 0.65f && roughness < 0.05f && rmsNorm < 0.9f -> HindiTtsService.Emotion.SULTRY
+            rmsNorm < 0.45f && hnr > 0.60f && roughness < 0.05f        -> HindiTtsService.Emotion.TENDER
+            f0 < f0Mean * 0.97f && hnr > 0.70f && roughness < 0.04f   -> HindiTtsService.Emotion.VELVETY
+            hnr > 0.65f && roughness < 0.05f && rmsNorm in 0.4f..1.1f -> HindiTtsService.Emotion.WARM
+            f0 > f0Mean * 1.08f && roughness < 0.08f && rmsNorm > 0.6f && hnr > 0.6f -> HindiTtsService.Emotion.HAPPY
+            f0 < f0Mean * 0.93f && abs(f0Slope) < 0.05f && rmsNorm < 0.7f -> HindiTtsService.Emotion.SAD
+            f0Slope < -0.10f && rmsNorm < 0.9f && hnr < 0.45f         -> HindiTtsService.Emotion.DISGUST
+            else                                                         -> HindiTtsService.Emotion.NEUTRAL
+        }
+
         emotionHistory.addLast(emotion)
         if (emotionHistory.size > 7) emotionHistory.removeFirst()
-        val smoothed = emotionHistory.groupingBy { it }.eachCount()
+        val smoothedEmotion = emotionHistory.groupingBy { it }.eachCount()
             .maxByOrNull { it.value }?.key ?: HindiTtsService.Emotion.NEUTRAL
 
-        if (smoothed != detectedEmotion) {
-            detectedEmotion = smoothed
-            HindiTtsService.currentEmotion = smoothed
-            CaptionLogger.log(TAG, "Emotion→${smoothed.name}[${smoothed.category}] " +
-                "F0=${f0.toInt()}Hz slope=${"%.2f".format(f0Slope)} " +
-                "jitter=${"%.3f".format(f0Jitter)} rms=${rmsNorm.format()} hnr=${hnr.format()} " +
-                "spd=${smoothed.speedMult} pch=${smoothed.pitchMult}")
+        // ── PUBLISH VOICE PROFILE ─────────────────────────────────────────────
+        val smoothSpeed  = speedBuf.average().toFloat().coerceIn(0.6f, 1.8f)
+        val smoothPitch  = pitchBuf.average().toFloat().coerceIn(0.75f, 1.35f)
+        val smoothVol    = volumeBuf.average().toFloat().coerceIn(0.4f, 2.0f)
+        val smoothBreath = breathBuf.average().toFloat().coerceIn(0f, 1f)
+        val smoothRough  = roughBuf.average().toFloat().coerceIn(0f, 1f)
+
+        val newProfile = VoiceProfile(
+            speed       = smoothSpeed,
+            pitch       = smoothPitch,
+            volume      = smoothVol,
+            breathiness = smoothBreath,
+            roughness   = smoothRough,
+            pitchSlope  = pitchSlope,
+            emotion     = smoothedEmotion
+        )
+
+        if (newProfile != currentProfile) {
+            currentProfile = newProfile
+            HindiTtsService.currentEmotion = smoothedEmotion
         }
 
-        if (frameCount % 5 == 0)
-            CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz → $gender | ${smoothed.name} " +
-                "spd=${smoothed.speedMult} pch=${smoothed.pitchMult}")
+        if (frameCount % 8 == 0)
+            CaptionLogger.log(TAG, "PROFILE F0=${f0.toInt()}Hz|${maj} " +
+                "spd=${"%.2f".format(smoothSpeed)} pch=${"%.2f".format(smoothPitch)} " +
+                "vol=${"%.2f".format(smoothVol)} breath=${"%.2f".format(smoothBreath)} " +
+                "rough=${"%.3f".format(smoothRough)} slope=$pitchSlope " +
+                "emo=${smoothedEmotion.name}")
     }
 
-    private fun Float.format() = String.format("%.2f", this)
+    private fun updateSmoothing(pitch: Float?, vol: Float, breath: Float, rough: Float) {
+        val i = bufIdx % PROFILE_SMOOTH
+        if (pitch != null) pitchBuf[i] = pitch
+        volumeBuf[i] = vol
+        breathBuf[i] = breath
+        roughBuf[i]  = rough
+    }
 }
